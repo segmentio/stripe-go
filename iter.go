@@ -2,6 +2,9 @@ package stripe
 
 import (
 	"reflect"
+	"time"
+
+	"github.com/segmentio/backo-go"
 )
 
 // Query is the function used to get a page listing.
@@ -16,19 +19,22 @@ type Query func(*RequestValues) ([]interface{}, ListMeta, error)
 // Iterators are not thread-safe, so they should not be consumed
 // across multiple goroutines.
 type Iter struct {
-	query  Query
-	qs     *RequestValues
-	values []interface{}
-	meta   ListMeta
-	params ListParams
-	err    error
-	cur    interface{}
+	backoff *backo.Backo
+	query   Query
+	qs      *RequestValues
+	values  []interface{}
+	meta    ListMeta
+	params  ListParams
+	err     error
+	cur     interface{}
 }
 
 // GetIter returns a new Iter for a given query and its options.
 func GetIter(params *ListParams, qs *RequestValues, query Query) *Iter {
 	iter := &Iter{}
 	iter.query = query
+
+	iter.backoff = backo.NewBacko(1*time.Minute, 2, 1, 30*time.Minute)
 
 	p := params
 	if p == nil {
@@ -47,7 +53,21 @@ func GetIter(params *ListParams, qs *RequestValues, query Query) *Iter {
 }
 
 func (it *Iter) getPage() {
-	it.values, it.meta, it.err = it.query(it.qs)
+	for i := 0; i < 5; i++ {
+		it.values, it.meta, it.err = it.query(it.qs)
+
+		if it.err == nil {
+			break
+		}
+
+		stripeError, isStripeError := it.err.(*Error)
+		if isStripeError && stripeError.Type != ErrorTypeRateLimit && stripeError.Type != ErrorTypeAPIConnection && stripeError.Type != ErrorTypeAPI {
+			break
+		}
+
+		it.backoff.Sleep(i)
+	}
+
 	if it.params.End != "" {
 		// We are moving backward,
 		// but items arrive in forward order.
